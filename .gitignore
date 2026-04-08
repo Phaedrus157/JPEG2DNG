@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Output files
+*.dng
+*.tif
+*.tiff
+
+# Logs
+*.log
+
+# Environment
+.env
+.venv
+venv/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
