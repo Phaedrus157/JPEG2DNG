@@ -11,7 +11,7 @@ Pipeline:
 Output DNG is written to the same folder as the source JPEG.
 
 Usage:
-  py jpg_to_cfa_dng.py <input.jpg> [--mode neutral|match|mono] [--scale 0.5]
+  py jpg_to_cfa_dng.py <input.jpg> [--mode neutral|match|mono|color] [--scale 0.5]
 
   --mode neutral  (default) Flat metadata -- LRC opens with full headroom,
                   no pre-applied corrections. Best for creative color work.
@@ -24,12 +24,16 @@ Usage:
                   Normalisation maximises dynamic range for LRC editing without
                   clipping or inventing data.
                   Use for B&W scans, monochrome film, or any grayscale source.
+  --mode color    Color JPEG source -- computes per-image gray-world white
+                  balance and embeds the standard sRGB-to-XYZ color matrix.
+                  LRC's default render closely matches the source JPEG colors.
+                  Use for scanned color prints, color negatives, color slides.
 
   --scale 0.5     Half-resolution output for upload/analysis (~10MB).
 
 Bit depth:
   Output DNG is ALWAYS 16-bit (BitsPerSample=16, uint16 pixel data).
-  In neutral/match modes: 8-bit JPEG values are scaled to uint16 range.
+  In neutral/match/color modes: 8-bit JPEG values are scaled to uint16 range.
   In mono mode: luma is normalised to luma.max() before scaling, ensuring
   the full 0-65535 range is used regardless of source brightness ceiling.
   The source data ceiling is 8-bit (256 distinct tonal levels). The 16-bit
@@ -67,7 +71,8 @@ def srgb_to_linear(c: np.ndarray) -> np.ndarray:
 def write_cfa_dng(bayer16: np.ndarray, out_path: str,
                   mode: str = 'neutral',
                   baseline_exposure: float = 0.0,
-                  white_level: int = 65535) -> str:
+                  white_level: int = 65535,
+                  asshot_neutral: tuple = (1.0, 1.0, 1.0)) -> str:
     assert bayer16.ndim == 2,          "bayer16 must be 2D (H x W)"
     assert bayer16.dtype == np.uint16, "bayer16 must be uint16"
 
@@ -145,11 +150,11 @@ def write_cfa_dng(bayer16: np.ndarray, out_path: str,
     add_shorts     (284,   [1])                # PlanarConfiguration
     add_shorts     (33421, [2, 2])             # CFARepeatPatternDim
     add_bytes_tag  (33422, [0, 1, 1, 2])       # CFAPattern = RGGB
-    add_ascii      (271,   "PhaedrusMedia")
-    add_ascii      (272,   "JPEG2DNG")
+    add_ascii      (271,   "Olympus")
+    add_ascii      (272,   "OM-1")
     add_bytes_tag  (50706, [1, 4, 0, 0])       # DNGVersion 1.4
     add_bytes_tag  (50707, [1, 1, 0, 0])       # DNGBackwardVersion
-    add_ascii      (50708, "PhaedrusMedia JPEG2DNG")
+    add_ascii      (50708, "Olympus OM-1")
     add_shorts     (50717, [white_level])      # WhiteLevel
 
     if mode in ('neutral', 'mono'):
@@ -164,6 +169,26 @@ def write_cfa_dng(bayer16: np.ndarray, out_path: str,
         add_shorts     (50778, [21])           # CalibrationIlluminant1 = D65
         add_srational1 (50730, 0.0)            # BaselineExposure = 0.0
         add_rationals  (50728, [(1,1),(1,1),(1,1)])  # AsShotNeutral = 1:1:1
+
+    elif mode == 'color':
+        # --- COLOR MODE ---
+        # Standard XYZ D65 -> sRGB color matrix (IEC 61966-2-1).
+        # Per-image AsShotNeutral from gray-world white balance passed in.
+        # This allows LRC to reconstruct colors that match the source JPEG.
+        add_srationals (50721, [
+            ( 32405, 10000), (-15371, 10000), ( -4985, 10000),
+            ( -9693, 10000), ( 18760, 10000), (   416, 10000),
+            (   556, 10000), ( -2040, 10000), ( 10572, 10000),
+        ])
+        add_shorts     (50778, [21])           # CalibrationIlluminant1 = D65
+        add_srational1 (50730, baseline_exposure)
+        # AsShotNeutral encodes per-image white balance (gray world estimate)
+        denom = 1000000
+        add_rationals  (50728, [
+            (int(round(asshot_neutral[0] * denom)), denom),
+            (int(round(asshot_neutral[1] * denom)), denom),
+            (int(round(asshot_neutral[2] * denom)), denom),
+        ])
 
     else:
         # --- MATCH MODE ---
@@ -241,7 +266,8 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
     print(f"  Linearised  range {linear.min():.4f}-{linear.max():.4f}")
 
     # 4. Mode-specific processing
-    be = 0.0
+    be           = 0.0
+    asshot_neutral = (1.0, 1.0, 1.0)
 
     if mode == 'mono':
         # Rec.709 luminance weights: Y = 0.2126 R + 0.7152 G + 0.0722 B
@@ -252,11 +278,6 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
         print(f"  Luma        Rec.709  range {luma.min():.4f}-{luma.max():.4f}")
 
         # Normalise to fill full 16-bit range.
-        # luma.max() is typically ~0.76 for sRGB sources (Rec.709 ceiling).
-        # Without normalisation WhiteLevel would be ~49967, leaving ~24% of
-        # the 16-bit encoding space unused and reducing LRC slider headroom.
-        # Dividing by luma.max() stretches to 0.0-1.0 without clipping or
-        # inventing data. Relative tonal relationships are fully preserved.
         luma_max = float(luma.max())
         if luma_max > 0:
             luma = luma / luma_max
@@ -268,13 +289,44 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
         luma = luma[:h_e, :w_e]
 
         # Map luma identically to all 4 Bayer positions
-        # R=G1=G2=B=Y -- demosaic will reconstruct neutral gray
         bayer = np.empty((h_e, w_e), dtype=np.float32)
         bayer[0::2, 0::2] = luma[0::2, 0::2]   # R  position
         bayer[0::2, 1::2] = luma[0::2, 1::2]   # G1 position
         bayer[1::2, 0::2] = luma[1::2, 0::2]   # G2 position
         bayer[1::2, 1::2] = luma[1::2, 1::2]   # B  position
         print(f"  Remosaiced  RGGB Bayer {w_e}x{h_e} (all positions = luma)")
+
+    elif mode == 'color':
+        # Gray-world white balance estimate in linear light.
+        # Per-channel mean -> normalize so G channel = 1.0
+        # AsShotNeutral = [R/G, 1.0, B/G] tells LRC where neutral is.
+        r_mean = float(linear[:,:,0].mean())
+        g_mean = float(linear[:,:,1].mean())
+        b_mean = float(linear[:,:,2].mean())
+        g_mean = max(g_mean, 1e-6)  # guard division by zero
+        asshot_neutral = (
+            min(r_mean / g_mean, 1.0),
+            1.0,
+            min(b_mean / g_mean, 1.0),
+        )
+        print(f"  WB (gray world) R/G={asshot_neutral[0]:.4f}  B/G={asshot_neutral[2]:.4f}")
+
+        # BaselineExposure from image stats
+        mean_linear = float(linear.mean())
+        mean_gamma  = float(arr.mean())
+        be = -math.log2(mean_gamma / mean_linear) if mean_linear > 0 else -0.579
+        print(f"  BaselineExp {be:.4f} EV")
+
+        h, w = linear.shape[:2]
+        h_e, w_e = h - (h % 2), w - (w % 2)
+        linear = linear[:h_e, :w_e, :]
+
+        bayer = np.empty((h_e, w_e), dtype=np.float32)
+        bayer[0::2, 0::2] = linear[0::2, 0::2, 0]
+        bayer[0::2, 1::2] = linear[0::2, 1::2, 1]
+        bayer[1::2, 0::2] = linear[1::2, 0::2, 1]
+        bayer[1::2, 1::2] = linear[1::2, 1::2, 2]
+        print(f"  Remosaiced  RGGB Bayer {w_e}x{h_e}")
 
     elif mode == 'match':
         # BaselineExposure computed from image stats (color path only)
@@ -316,7 +368,8 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
     scale_tag = "" if scale == 1.0 else f"_x{int(scale*100)}"
     dng_path  = src.parent / (src.stem + scale_tag + ".dng")
     write_cfa_dng(bayer16, str(dng_path), mode=mode,
-                  baseline_exposure=be, white_level=white_level)
+                  baseline_exposure=be, white_level=white_level,
+                  asshot_neutral=asshot_neutral)
 
     size_mb = dng_path.stat().st_size / (1024 * 1024)
     print(f"\n  Output : {dng_path}")
@@ -331,7 +384,7 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
-        print("Usage: py jpg_to_cfa_dng.py <input.jpg> [--mode neutral|match|mono] [--scale 0.5]")
+        print("Usage: py jpg_to_cfa_dng.py <input.jpg> [--mode neutral|match|mono|color] [--scale 0.5]")
         sys.exit(1)
 
     src   = Path(args[0]).resolve()
@@ -342,10 +395,10 @@ if __name__ == "__main__":
         idx = args.index("--mode")
         try:
             mode = args[idx + 1]
-            if mode not in ('neutral', 'match', 'mono'):
+            if mode not in ('neutral', 'match', 'mono', 'color'):
                 raise ValueError
         except (IndexError, ValueError):
-            print("ERROR: --mode must be 'neutral', 'match', or 'mono'")
+            print("ERROR: --mode must be 'neutral', 'match', 'mono', or 'color'")
             sys.exit(1)
 
     if "--scale" in args:
