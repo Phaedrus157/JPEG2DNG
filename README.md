@@ -1,209 +1,353 @@
-JPEG2DNG
-========
+# JPEG2DNG
 
-Converts a JPEG to a synthetic CFA (Bayer) DNG that triggers Adobe Lightroom
-Classic's full raw processing pipeline — including raw-gated features, AI
-Denoise, Adobe Color and Monochrome profiles, masking, and the complete
-Develop module.
+Converts JPEG or 16-bit TIFF images to synthetic CFA (Bayer) DNG files that
+trigger Adobe Lightroom Classic's full raw processing pipeline — including
+**AI Denoise**, **Raw Details**, Adobe Color and Monochrome profiles, raw-gated
+masking tools, and the complete Develop module.
 
+> **Important:** This tool was developed and tested against **scanned
+> photographic film** — colour slides, colour negatives, and B&W negatives
+> scanned to JPEG or TIFF. The source images are fully-rendered, display-referred
+> sRGB files from a film scanner. They are **not** camera sensor data. This
+> distinction is fundamental to understanding both the capabilities and the known
+> limitations documented below.
 
-The problem it solves
----------------------
+---
+
+## Contents
+
+- [The problem it solves](#the-problem-it-solves)
+- [Requirements](#requirements)
+- [Usage](#usage)
+- [Modes](#modes)
+- [Monochrome — recommended and well-tested](#monochrome--recommended-and-well-tested)
+- [Color — functional with known limitations](#color--functional-with-known-limitations)
+- [Color vs Monochrome: an honest assessment](#color-vs-monochrome-an-honest-assessment)
+- [Gamma blend parameter](#gamma-blend-parameter)
+- [16-bit TIFF input](#16-bit-tiff-input)
+- [Companion batch scripts](#companion-batch-scripts)
+- [Technical notes](#technical-notes)
+- [License](#license)
+
+---
+
+## The problem it solves
 
 Lightroom Classic withholds a substantial part of its processing capability
-from JPEGs. AI Denoise, raw-specific tone mapping, Adobe Color and Monochrome
-profiles, and certain masking tools are available only to raw files. JPEG2DNG
-re-encodes a JPEG as a syntactically valid CFA DNG — a raw format Lightroom
-recognises — unlocking these features for scanned film, archival images, or
-any JPEG source that warrants full raw processing.
+from JPEGs and TIFFs. AI Denoise, Raw Details, raw-specific tone mapping, Adobe
+Color and Monochrome profiles, and certain masking tools are available **only
+to raw files**. JPEG2DNG re-encodes a JPEG or 16-bit TIFF as a syntactically
+valid CFA DNG — a raw format Lightroom recognises — unlocking these features
+for scanned film, archival images, or any pre-rendered source that warrants
+full raw processing capability.
 
-The output DNG contains no invented pixel data. The source JPEG's tonal
-values are preserved through a precise linearisation step and written into a
-16-bit RGGB Bayer container. Lightroom's demosaic engine then reconstructs
-the image and applies its raw processing pipeline from that point forward.
+The output DNG contains **no invented pixel data**. Source tonal values are
+preserved through a linearisation step and written into a 16-bit RGGB Bayer
+container. Lightroom's demosaic engine reconstructs the image and applies its
+raw pipeline from that point forward.
 
+---
 
-Conversion modes
-----------------
+## Requirements
 
-Four modes are available, selected with the --mode flag:
+Python 3.8 or later. No C compiler, no DNG SDK, no ExifTool required.
 
-neutral (default)
-    Identity color matrix, flat metadata, no pre-applied corrections.
-    Lightroom opens the DNG with full headroom and its default rendering.
-    Best for creative color work or any case where you want LRC to start
-    from scratch.
+```
+pip install Pillow numpy
+```
 
-match
-    Calibrated ColorMatrix and computed BaselineExposure. LRC's default
-    render approximates the visual appearance of the source JPEG.
-    Best for archival work where faithful reproduction of the original
-    scan is the priority.
+---
 
-mono
-    Purpose-built for scanned B&W film and any grayscale source.
-    Converts to Rec.709 luminance in linear light (correct spectral
-    weighting), normalises luma to fill the full 0-65535 16-bit range,
-    then maps the identical luma value to all four Bayer positions
-    (R=G1=G2=B=Y). This eliminates the color fringing and false color
-    artifacts that occur when a demosaic algorithm processes a signal
-    with zero inter-channel variation. Output is a true neutral-gray
-    DNG. Adobe Monochrome profile and all B&W-specific processing tools
-    in LRC are fully available.
+## Usage
 
-color
-    Purpose-built for scanned color prints, color negatives, and color
-    slides where the JPEG already carries fully-developed color science
-    baked in by the scanner.
+```bash
+# Single file — monochrome scan (recommended)
+py jpg_to_cfa_dng.py scan.jpg --mode mono
 
-    The problem with converting processed color JPEGs via neutral or match
-    mode is that Lightroom applies its own camera color rendering on top of
-    the already-processed image, producing double color science and wrong
-    hues. The color mode solves this by:
+# Single file — colour scan from JPEG
+py jpg_to_cfa_dng.py scan.jpg --mode color
 
-      1. Computing a per-image gray-world white balance estimate in linear
-         light (R_mean/G_mean, 1.0, B_mean/G_mean), which tells LRC exactly
-         where neutral is for this specific image.
-      2. Embedding the standard IEC 61966-2-1 sRGB-to-XYZ D65 ColorMatrix,
-         which matches the color space of the source JPEG.
-      3. Computing BaselineExposure from the image's mean linear/gamma ratio
-         so LRC's initial exposure rendering is calibrated to the source.
+# Single file — colour scan from 16-bit LRC-exported TIFF
+py jpg_to_cfa_dng.py scan.tif --mode neutral --gamma 0.75
 
-    The result: LRC's default render closely matches the source JPEG's
-    colors while still providing the full raw processing pipeline — AI
-    Denoise, Adobe Color profiles, masking, and 16-bit headroom for
-    non-destructive editing.
+# Half-resolution output for upload or analysis
+py jpg_to_cfa_dng.py scan.jpg --mode mono --scale 0.5
+```
 
-    Best for scanned color film, color prints, or any color JPEG source
-    that requires full raw processing features.
+The output DNG is written to the same folder as the source file with the same
+base filename. A scale suffix (`_x50`) is appended when `--scale` is used.
 
+---
 
-Bit depth
----------
+## Modes
 
-All output DNGs are 16-bit regardless of mode. The source JPEG contains
-256 distinct tonal levels (8-bit). Storing these in a 16-bit container
-provides precision headroom for LRC's non-linear processing — tone curves,
-masks, parametric adjustments — and prevents quantization banding in smooth
-gradients during heavy Develop work. No tonal data is invented; the 16-bit
-values are a scaled representation of the original 8-bit source.
+| Flag | Best for |
+|---|---|
+| `--mode mono` | Scanned B&W negatives, B&W prints, any grayscale source |
+| `--mode color` | Scanned colour JPEG (negative or slide) |
+| `--mode neutral` | 16-bit TIFF pre-processed by LRC; also useful as a flat starting point |
+| `--mode match` | Colour JPEG where faithful approximation of source appearance is priority |
 
-In mono mode, luma is normalised to luma.max() before scaling to 16-bit.
-This stretches the tonal range to use the full encoding space, maximising
-slider headroom in LRC without clipping or modifying relative tonal
-relationships.
+---
 
+## Monochrome — recommended and well-tested
 
-Requirements
-------------
+`--mode mono` is the most successful and reliable mode in this tool. It was
+developed for scanned B&W film negatives and has been used in production on
+archival documentary photography.
 
-Python 3.8 or later.
-Pillow and NumPy are the only dependencies — no C compiler, no external
-tools, no DNG SDK required.
+**Why it works so well:**
 
-    pip install Pillow numpy
+The monochrome conversion collapses all three colour channels to a single
+Rec.709 luminance value in linear light:
 
+```
+Y = 0.2126 R + 0.7152 G + 0.0722 B
+```
 
-Usage
------
+This luma value is then normalised to fill the full 0–65535 16-bit range
+(`luma / luma.max()`), and written **identically to all four Bayer positions**
+(R = G1 = G2 = B = Y). Because all channels carry the same value, Lightroom's
+demosaic algorithm has nothing to push around — no inter-channel variation means
+no colour fringing, no false colour, no camera-profile push. The result is a
+true neutral-grey DNG that Lightroom processes cleanly as a monochrome raw file.
 
-Single file, default neutral mode:
+Adobe Monochrome profile, all B&W-specific controls in the Develop module, AI
+Denoise, and Raw Details are fully available and behave correctly.
 
-    py jpg_to_cfa_dng.py image.jpg
+**Monochrome workflow:**
 
-Monochrome mode for scanned B&W film (recommended for all grayscale sources):
+```
+Scanner JPEG (B&W negative)
+    -> jpg_to_cfa_dng.py --mode mono
+    -> CFA DNG (16-bit, neutral grey Bayer)
+    -> Lightroom Classic: import, AI Denoise, level, crop, heal
+    -> Export neutral JPEG for tonal analysis
+    -> LRCNeutralizer: statistical tonal neutralisation written to DNG XMP
+    -> Lightroom Classic: Read Metadata from Files
+    -> Silver Efex Pro: film emulation, grain, zone system finishing
+    -> 16-bit TIFF delivery
+```
 
-    py jpg_to_cfa_dng.py scan.jpg --mode mono
+The companion project [LRCNeutralizer](https://github.com/Phaedrus157/LRCNeutralizer)
+automates the tonal neutralisation step by analysing exported JPEGs and writing
+recommended Develop slider values (Exposure, Whites, Blacks, Highlights, Shadows)
+directly into each DNG's embedded XMP metadata.
 
-Color mode for scanned color prints, negatives, or slides:
+---
 
-    py jpg_to_cfa_dng.py scan.jpg --mode color
+## Color — functional with known limitations
 
-Match mode for archival faithful reproduction of color JPEGs:
+Color conversion is significantly more complex than monochrome because Lightroom's
+raw processing pipeline was designed for camera sensor data, not for
+display-referred sRGB images from a film scanner. The tool provides two paths
+depending on source type.
 
-    py jpg_to_cfa_dng.py scan.jpg --mode match
+### Colour JPEG source (`--mode color`)
 
-Half-resolution output for upload or analysis (useful for large scans):
+For JPEG scans that have not been pre-processed in Lightroom:
 
-    py jpg_to_cfa_dng.py scan.jpg --mode mono --scale 0.5
+- Computes a per-image **gray-world white balance** estimate in linear light
+  (`R_mean/G_mean`, `1.0`, `B_mean/G_mean`) and embeds this as `AsShotNeutral`
+- Embeds the standard IEC 61966-2-1 **sRGB-to-XYZ D65 ColorMatrix**
+- Computes **BaselineExposure** from the ratio of gamma mean to linear mean
 
-The output DNG is written to the same folder as the source JPEG with the
-same base filename. A scale tag (_x50) is appended when --scale is used.
+The gray-world estimate is per-image, computed after sRGB gamma removal (correct
+radiometric domain). The result is clipped to 1.0 per channel to stay within
+valid DNG range.
 
+**Known limitation with JPEG source:** Gray-world WB assumes the average scene
+is neutral grey. It fails on images with strongly dominant hues (heavy blue sky,
+black rock filling the frame). These images will show a cast in LRC. The
+`--gamma` parameter (see below) helps with shadow rendering but does not fix
+WB for these edge cases. White balance correction in LRC with the WB picker
+resolves them individually.
 
-Choosing the right mode
------------------------
+### 16-bit TIFF source — pre-processed by LRC (`--mode neutral`)
 
-Source type                          Recommended mode
-------------------------------------+----------------
-Scanned B&W negative or print       mono
-Scanned color negative or print     color
-Color slide (Kodachrome, Ektachrome) color
-Digital JPEG (camera, phone)        neutral or color
-Archival faithful reproduction      match
+When the source is a 16-bit TIFF exported from Lightroom (after cropping,
+levelling, initial cleanup), gray-world WB is **bypassed entirely**:
 
+- `AsShotNeutral = (1.0, 1.0, 1.0)` — tells LRC the data is already balanced
+- Identity `ColorMatrix` — no colour transform applied by LRC
+- `Make="Adobe"` `Model="DNG"` — causes LRC to use Adobe Standard profile
+  (flat, neutral) instead of a camera-specific profile
 
-Workflow context
-----------------
+**Why TIFF requires different handling:** The TIFF is already rendered and
+colour-balanced by Lightroom's previous processing pass. Applying gray-world WB
+to a pre-balanced image produces an incorrect `AsShotNeutral` and a visible
+colour cast. Similarly, using a camera-specific colour profile (such as
+Olympus OM-1, which was the original Make/Model in this script) compounds
+the problem by applying sensor-calibrated colour science to data that was
+never from that sensor.
 
-JPEG2DNG is the first step in a pipeline designed for scanned film archival
-work. Two typical workflows:
+**Recommended workflow for colour scanned film:**
 
-B&W film pipeline:
+```
+Original scanned JPEG
+    -> Lightroom Classic: import, crop, level, initial cleanup
+    -> Export as 16-bit TIFF (sRGB, no compression)
+    -> color_analyze_jpg.py  (per-image gamma_blend analysis)
+    -> Review/adjust analysis CSV
+    -> batch_jpg_to_dng_color.py --mode neutral --csv <analysis.csv>
+    -> CFA DNGs (per-image gamma, identity matrix, neutral WB)
+    -> Lightroom Classic: import, WB fine-tune, AI Denoise, color grading
+```
 
-    Scanner JPEG
-        -> jpg_to_cfa_dng.py --mode mono
-        -> CFA DNG (16-bit, neutral gray Bayer)
-        -> Lightroom Classic: AI Denoise, level, crop, tone neutralisation
-        -> LRCNeutralizer (statistical tonal neutralisation written to XMP)
-        -> Silver Efex Pro (film emulation, grain, selenium tone)
-        -> 16-bit TIFF delivery
+The batch pipeline scripts for this workflow live in
+`C:\Users\jaa15\OneDrive\PYProjects\Scripts\` and are documented in the
+[Companion batch scripts](#companion-batch-scripts) section.
 
-Color film pipeline:
+---
 
-    Scanner JPEG
-        -> jpg_to_cfa_dng.py --mode color
-        -> CFA DNG (16-bit, per-image white balance, sRGB color matrix)
-        -> Lightroom Classic: AI Denoise, white balance fine-tune, color grading
-        -> 16-bit TIFF delivery
+## Color vs Monochrome: an honest assessment
 
-The companion project LRCNeutralizer automates the tonal neutralisation step
-for B&W work by analysing exported JPEGs and writing recommended LRC Develop
-slider values directly into each DNG's embedded XMP metadata.
+Monochrome conversion via `--mode mono` is **substantially more successful**
+than colour conversion. The reasons are structural, not implementation gaps.
 
+**Why mono works cleanly:**
 
-Technical notes
----------------
+1. The B&W scan has no meaningful colour information — all channels carry the
+   same luminance signal. There is nothing for the demosaic algorithm or LRC's
+   colour pipeline to distort.
+2. Placing identical luma in all four Bayer positions means Lightroom's demosaic
+   reconstructs a perfectly neutral image regardless of which colour profile,
+   white balance, or colour matrix is applied.
+3. The output is mathematically consistent with Lightroom's expectations for a
+   monochrome raw file.
 
-The DNG is built from scratch using Python's struct module — no external DNG
-library is required. The TIFF/IFD structure is constructed directly, which
-keeps the dependency footprint minimal and makes the format logic fully
-transparent and auditable.
+**Why colour is harder:**
 
-Color mode gray-world white balance is computed in linear light (after sRGB
-gamma removal), which is the physically correct domain for radiometric
-calculations. The result is clipped to a maximum of 1.0 per channel to
-prevent AsShotNeutral values outside the valid DNG range.
+1. The scanned JPEG is a fully-rendered, display-referred sRGB image. It has
+   already passed through the scanner's colour processing — colour balance,
+   tone curve, saturation. There is **no spectral separation** left. The R, G,
+   and B channels do not represent raw sensor responses to different wavelengths;
+   they represent a finished colour image.
+2. Lightroom's raw pipeline was designed to take spectrally-separated raw sensor
+   data and reconstruct colour through a camera profile calibrated to that
+   specific sensor. Applied to pre-rendered sRGB data, this pipeline applies
+   colour science that has no relationship to the original film's colour
+   characteristics.
+3. The sRGB gamma curve bakes display-referred tonal relationships into the
+   pixel values. When the script removes this gamma to produce linear-light data
+   (as a real raw converter would), LRC's raw tone curve then applies on top —
+   stacking two tone curves and crushing shadows. The `--gamma` blend parameter
+   was developed to mitigate this.
+4. The RGGB Bayer pattern gives the green channel twice the spatial representation
+   of red or blue. Lightroom's demosaic interpolates red and blue from fewer
+   source pixels, which can introduce subtle hue shifts even with a perfectly
+   neutral white balance and identity colour matrix.
 
-ColorMatrix in color mode uses the standard IEC 61966-2-1 XYZ D65 to sRGB
-matrix, which is the correct inverse transform for sRGB-encoded sources.
-This matrix, combined with the per-image AsShotNeutral, gives LRC enough
-information to reconstruct the original white balance without applying an
-additional camera-profile color transform.
+**The practical result:**
 
-ColorMatrix values in match mode were measured from actual DNG pixel analysis
-rather than derived from a camera profile database. They are calibrated for
-the sRGB->linear linearisation path used by this script.
+Colour DNGs from this tool are an acceptable starting point for creative editing
+and provide access to AI Denoise and Raw Details that are otherwise unavailable.
+They are **not** a pixel-accurate reconstruction of the source JPEG's colour
+rendering. A residual cool/cyan shift relative to the source is typical and
+expected. This is correctable in LRC with the WB picker (one image, sync to all)
+and provides a clean creative foundation from the raw editing pipeline.
 
-The Bayer pattern is RGGB. LRC's demosaic engine handles this pattern
-natively for all DNG files.
+For archival work requiring faithful colour reproduction, the TIFF export from
+Lightroom remains the definitive colour reference. The DNG is the raw editing
+companion.
 
-Output DNGs carry Olympus as Make and OM-1 as Model, which allows
-Lightroom's Library and filtering tools to identify and group them, and
-associates them with a known camera profile set in LRC.
+---
 
+## Gamma blend parameter
 
-License
--------
+`--gamma` controls how much of the sRGB display gamma is removed before writing
+pixel data into the DNG. This was developed specifically for scanned film where
+the gamma-related shadow rendering problem is most visible.
+
+| Value | Behaviour |
+|---|---|
+| `1.0` (default) | Full sRGB linearisation (IEC 61966-2-1). Mathematically correct for raw. Can crush shadows when LRC's raw tone curve stacks on top. |
+| `0.0` | No linearisation. Gamma-encoded values written as-is. Softest shadows; closest to original scan appearance. |
+| `0.5` | Midpoint blend. Good starting point for scanned slides with heavy shadow areas. |
+
+Recommended starting points by scene type:
+
+| Scene | `--gamma` |
+|---|---|
+| Outdoor, even tones | 0.75 – 1.0 |
+| Mixed interior/exterior | 0.50 – 0.75 |
+| Interior, window/door frame | 0.30 – 0.50 |
+| Heavy shadow interior | 0.25 – 0.40 |
+
+The companion `color_analyze_jpg.py` script automates per-image gamma selection
+by analysing luminance distribution, shadow density, and edge/centre contrast
+ratios before conversion.
+
+---
+
+## 16-bit TIFF input
+
+The script accepts 16-bit TIFF files (Pillow auto-detects bit depth):
+
+- **16-bit TIFF** normalises by 65535 → float32 [0,1] → uint16 DNG
+- **8-bit JPEG or TIFF** normalises by 255 → float32 [0,1] → uint16 DNG
+
+16-bit TIFF input from an LRC export provides 256× more shadow tonal precision
+than 8-bit JPEG, directly improving `--gamma` accuracy in low-key zones. For
+archival colour work, the recommended pipeline uses 16-bit TIFF as the
+conversion source rather than the original 8-bit scanner JPEG.
+
+---
+
+## Companion batch scripts
+
+The following scripts extend JPEG2DNG into a full batch pipeline for colour
+film scanning work. They are not part of this repository but are maintained at
+`C:\Users\jaa15\OneDrive\PYProjects\Scripts\`.
+
+**`color_analyze_jpg.py`**
+Analyses a folder of source JPG or TIF files and recommends a per-image
+`gamma_blend` value based on five metrics: mean luminance, shadow density,
+luminance standard deviation, edge/centre contrast ratio (dark-frame detection),
+and channel dominance (gray-world WB reliability flag). Outputs a CSV that
+feeds the batch converter.
+
+**`batch_jpg_to_dng_color.py`**
+Batch converts a folder of JPEG or TIFF files to CFA DNGs using per-image
+`gamma_blend` values from the analysis CSV. Includes internal QC (shadow crush,
+highlight clip, shadow delta vs source), automatic retry with stepped-down gamma
+on QC failure, and a NEEDS_REVIEW flag for images where all retries are
+exhausted.
+
+---
+
+## Technical notes
+
+**DNG structure:** Built from scratch using Python's `struct` module with no
+external DNG library. The TIFF/IFD structure is constructed directly, keeping
+the dependency footprint to Pillow and NumPy only.
+
+**Make/Model:** DNGs are tagged `Make="Adobe"` `Model="DNG"`. This causes
+Lightroom to use its Adobe Standard profile (flat, neutral) rather than a
+camera-specific colour profile. An earlier version used `Make="Olympus"`
+`Model="OM-1"` to associate files with a known profile set, but this caused
+Lightroom to apply sensor-calibrated colour science to scanner data, producing
+a systematic colour tint across all modes. The Adobe DNG tags avoid this.
+
+**Bayer pattern:** RGGB. Lightroom's demosaic engine handles this natively for
+all DNG files.
+
+**Gray-world WB domain:** Computed in linear light (after gamma removal), which
+is the physically correct radiometric domain. Result is clipped to ≤ 1.0 per
+channel to stay within valid DNG AsShotNeutral range.
+
+**BaselineExposure:** Computed from `−log2(mean_gamma / mean_linear)`, which
+calibrates LRC's initial exposure rendering to the source image's average
+brightness. With `gamma_blend < 1.0`, the blended-linear mean is higher than
+full-linear, so BaselineExposure is automatically less negative — LRC compensates
+less aggressively, which is correct behaviour.
+
+**ColorMatrix in color mode:** Uses the IEC 61966-2-1 XYZ D65 to sRGB matrix,
+the standard inverse transform for sRGB-encoded sources. For TIFF sources, the
+identity matrix is used instead (neutral mode) to avoid double colour transform.
+
+---
+
+## License
 
 MIT License. Copyright (c) 2025 Phaedrus157. See LICENSE for details.

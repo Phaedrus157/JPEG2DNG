@@ -1,17 +1,18 @@
 """
 jpg_to_cfa_dng.py
 =================
-Converts a JPEG to a synthetic CFA (Bayer) DNG that triggers Lightroom
-Classic's full raw processing pipeline -- including Adobe Color/Monochrome
-profiles and all raw-gated features.
+Converts a JPEG or 16-bit TIFF to a synthetic CFA (Bayer) DNG that triggers
+Lightroom Classic's full raw processing pipeline -- including Adobe Color/
+Monochrome profiles and all raw-gated features.
 
 Pipeline:
-  JPEG -> decode -> sRGB linearize -> RGGB remosaic -> pure-Python CFA DNG
+  JPEG/TIFF -> decode -> sRGB linearize (blended) -> RGGB remosaic -> CFA DNG
 
-Output DNG is written to the same folder as the source JPEG.
+Output DNG is written to the same folder as the source file.
 
 Usage:
-  py jpg_to_cfa_dng.py <input.jpg> [--mode neutral|match|mono|color] [--scale 0.5]
+  py jpg_to_cfa_dng.py <input.jpg|tif> [--mode neutral|match|mono|color]
+                                        [--scale 0.5] [--gamma 0.0-1.0]
 
   --mode neutral  (default) Flat metadata -- LRC opens with full headroom,
                   no pre-applied corrections. Best for creative color work.
@@ -24,22 +25,62 @@ Usage:
                   Normalisation maximises dynamic range for LRC editing without
                   clipping or inventing data.
                   Use for B&W scans, monochrome film, or any grayscale source.
-  --mode color    Color JPEG source -- computes per-image gray-world white
-                  balance and embeds the standard sRGB-to-XYZ color matrix.
-                  LRC's default render closely matches the source JPEG colors.
+  --mode color    Color JPEG or TIFF source.
+                  JPEG: computes per-image gray-world white balance and embeds
+                        the standard sRGB-to-XYZ color matrix.
+                  TIFF: skips gray-world WB (TIF is pre-processed by LRC and
+                        already color-balanced; gray-world would produce a tint).
+                        AsShotNeutral = (1,1,1). sRGB-to-XYZ matrix retained.
                   Use for scanned color prints, color negatives, color slides.
 
   --scale 0.5     Half-resolution output for upload/analysis (~10MB).
+                  Note: scale uses a uint8 proxy resize -- for analysis/test
+                  use only, not recommended for final archival output.
+
+  --gamma 0.75    Gamma blend factor (default 1.0).
+                  Controls how much of the sRGB gamma curve is removed before
+                  writing pixel data into the DNG.
+
+                  1.0 = full linearization (IEC 61966-2-1 piecewise).
+                        Mathematically correct for a raw sensor pipeline.
+                        Can crush shadows on images where the scan already has
+                        a display-referred gamma curve baked in and LRC's raw
+                        tone curve then stacks on top.
+
+                  0.0 = no linearization. Gamma-encoded sRGB values written
+                        directly into the DNG. Softest shadow rolloff; closest
+                        to the original scan appearance. LRC's raw pipeline
+                        still applies its tone curve so output will be brighter
+                        than source.
+
+                  0.5 = blend halfway between gamma and fully linear. Preserves
+                        shadow detail while still giving LRC meaningful linear-
+                        light data to work with. Good starting point for scanned
+                        slides or prints with heavy shadow regions or dark
+                        borders/frames.
+
+                  Recommended starting points by image type:
+                    Outdoor scenes, even tones      -->  0.75 - 1.0
+                    Mixed interior/exterior          -->  0.50 - 0.75
+                    Dark-framed (window/door border) -->  0.30 - 0.50
+                    Shadow-heavy interior            -->  0.25 - 0.40
 
 Bit depth:
   Output DNG is ALWAYS 16-bit (BitsPerSample=16, uint16 pixel data).
-  In neutral/match/color modes: 8-bit JPEG values are scaled to uint16 range.
+  Source bit depth is auto-detected on load:
+    8-bit  JPEG or TIFF  ->  normalised by 255   ->  float32 [0,1]  ->  uint16
+    16-bit TIFF          ->  normalised by 65535  ->  float32 [0,1]  ->  uint16
+  16-bit TIFF input from LRC export provides 256x more shadow precision
+  than 8-bit JPEG, directly improving gamma_blend accuracy in low-key zones.
   In mono mode: luma is normalised to luma.max() before scaling, ensuring
   the full 0-65535 range is used regardless of source brightness ceiling.
-  The source data ceiling is 8-bit (256 distinct tonal levels). The 16-bit
-  container provides precision headroom for LRC's non-linear processing
-  (curves, tone mapping, masking) and avoids quantization banding in
-  smooth gradients during heavy development. No data is invented.
+  No data is invented.
+
+Make/Model:
+  DNGs are tagged Make="Adobe" Model="DNG" so LRC uses Adobe Standard
+  profile -- flat and neutral, no camera-specific colour push.
+  Previously "Olympus OM-1" caused LRC to apply a sensor-calibrated
+  profile that produced a colour tint on all source types.
 
 Deps:
   Pillow, numpy  (no C compiler, no pidng, no exiftool required)
@@ -52,6 +93,9 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 
+# Extensions treated as pre-processed (LRC export) -- skip gray-world WB
+TIFF_EXTENSIONS = {'.tif', '.tiff'}
+
 
 # ---------------------------------------------------------------------------
 # sRGB -> linear light (IEC 61966-2-1 piecewise)
@@ -62,6 +106,21 @@ def srgb_to_linear(c: np.ndarray) -> np.ndarray:
         c / 12.92,
         ((c + 0.055) / 1.055) ** 2.4
     )
+
+
+# ---------------------------------------------------------------------------
+# Blended linearization
+# gamma_blend=1.0 -> full linear (existing behavior)
+# gamma_blend=0.0 -> keep sRGB gamma values as-is
+# gamma_blend=0.5 -> midpoint blend between gamma and linear
+# ---------------------------------------------------------------------------
+def apply_gamma_blend(arr: np.ndarray, gamma_blend: float) -> np.ndarray:
+    if gamma_blend >= 1.0:
+        return srgb_to_linear(arr)
+    if gamma_blend <= 0.0:
+        return arr.copy()
+    linear = srgb_to_linear(arr)
+    return arr * (1.0 - gamma_blend) + linear * gamma_blend
 
 
 # ---------------------------------------------------------------------------
@@ -140,49 +199,44 @@ def write_cfa_dng(bayer16: np.ndarray, out_path: str,
     add_shorts     (256,   [w])
     add_shorts     (257,   [h])
     add_shorts     (258,   [16])
-    add_shorts     (259,   [1])                # Compression = uncompressed
-    add_shorts     (262,   [32803])            # PhotometricInterpretation = CFA
-    add_longs      (273,   [0])                # StripOffsets (patched below)
-    add_shorts     (274,   [1])                # Orientation = top-left
-    add_shorts     (277,   [1])                # SamplesPerPixel = 1
-    add_longs      (278,   [h])                # RowsPerStrip
-    add_longs      (279,   [len(image_data)])  # StripByteCounts
-    add_shorts     (284,   [1])                # PlanarConfiguration
-    add_shorts     (33421, [2, 2])             # CFARepeatPatternDim
-    add_bytes_tag  (33422, [0, 1, 1, 2])       # CFAPattern = RGGB
-    add_ascii      (271,   "Olympus")
-    add_ascii      (272,   "OM-1")
-    add_bytes_tag  (50706, [1, 4, 0, 0])       # DNGVersion 1.4
-    add_bytes_tag  (50707, [1, 1, 0, 0])       # DNGBackwardVersion
-    add_ascii      (50708, "Olympus OM-1")
-    add_shorts     (50717, [white_level])      # WhiteLevel
+    add_shorts     (259,   [1])
+    add_shorts     (262,   [32803])
+    add_longs      (273,   [0])
+    add_shorts     (274,   [1])
+    add_shorts     (277,   [1])
+    add_longs      (278,   [h])
+    add_longs      (279,   [len(image_data)])
+    add_shorts     (284,   [1])
+    add_shorts     (33421, [2, 2])
+    add_bytes_tag  (33422, [0, 1, 1, 2])
+    # Make/Model = "Adobe"/"DNG" -> LRC uses Adobe Standard profile (neutral).
+    # "Olympus OM-1" previously caused a sensor-calibrated profile to be
+    # applied, producing a colour tint on all source types.
+    add_ascii      (271,   "Adobe")
+    add_ascii      (272,   "DNG")
+    add_bytes_tag  (50706, [1, 4, 0, 0])
+    add_bytes_tag  (50707, [1, 1, 0, 0])
+    add_ascii      (50708, "Adobe DNG")
+    add_shorts     (50717, [white_level])
 
     if mode in ('neutral', 'mono'):
-        # --- NEUTRAL / MONO MODE ---
-        # Identity ColorMatrix: no colour transform. LRC applies its own default.
-        # For mono: luma is already equal in all channels so identity is correct.
         add_srationals (50721, [
             (1,1),(0,1),(0,1),
             (0,1),(1,1),(0,1),
             (0,1),(0,1),(1,1),
         ])
-        add_shorts     (50778, [21])           # CalibrationIlluminant1 = D65
-        add_srational1 (50730, 0.0)            # BaselineExposure = 0.0
-        add_rationals  (50728, [(1,1),(1,1),(1,1)])  # AsShotNeutral = 1:1:1
+        add_shorts     (50778, [21])
+        add_srational1 (50730, 0.0)
+        add_rationals  (50728, [(1,1),(1,1),(1,1)])
 
     elif mode == 'color':
-        # --- COLOR MODE ---
-        # Standard XYZ D65 -> sRGB color matrix (IEC 61966-2-1).
-        # Per-image AsShotNeutral from gray-world white balance passed in.
-        # This allows LRC to reconstruct colors that match the source JPEG.
         add_srationals (50721, [
             ( 32405, 10000), (-15371, 10000), ( -4985, 10000),
             ( -9693, 10000), ( 18760, 10000), (   416, 10000),
             (   556, 10000), ( -2040, 10000), ( 10572, 10000),
         ])
-        add_shorts     (50778, [21])           # CalibrationIlluminant1 = D65
+        add_shorts     (50778, [21])
         add_srational1 (50730, baseline_exposure)
-        # AsShotNeutral encodes per-image white balance (gray world estimate)
         denom = 1000000
         add_rationals  (50728, [
             (int(round(asshot_neutral[0] * denom)), denom),
@@ -191,9 +245,6 @@ def write_cfa_dng(bayer16: np.ndarray, out_path: str,
         ])
 
     else:
-        # --- MATCH MODE ---
-        # Calibrated values measured from actual DNG pixel analysis (2026-04-01).
-        # Default render in LRC approximates the source JPEG.
         add_srationals (50721, [
             ( 31339, 10000), (-16169, 10000), ( -4906, 10000),
             ( -9788, 10000), ( 19161, 10000), (   335, 10000),
@@ -239,88 +290,104 @@ def write_cfa_dng(bayer16: np.ndarray, out_path: str,
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
-def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
+def convert(src: Path, mode: str = 'neutral', scale: float = 1.0,
+            gamma_blend: float = 1.0) -> Path:
     out_dir = src.parent
-    print(f"\n  Source : {src}")
-    print(f"  Mode   : {mode}")
-    print(f"  Scale  : {scale}")
-    print(f"  Output : {out_dir}\n")
+    is_tif  = src.suffix.lower() in TIFF_EXTENSIONS
 
-    # 1. Load JPEG as RGB
-    img = Image.open(src).convert("RGB")
+    print(f"\n  Source      : {src}")
+    print(f"  Mode        : {mode}")
+    print(f"  Scale       : {scale}")
+    print(f"  GammaBlend  : {gamma_blend:.2f}  (1.0=full linear, 0.0=keep gamma)")
+    print(f"  Output      : {out_dir}\n")
 
-    # 2. Resize if requested
+    # 1. Load source image (JPEG or TIFF) as float32 RGB in [0, 1].
+    img = Image.open(src)
+    if img.mode == 'I':
+        arr_raw   = np.array(img, dtype=np.int32).clip(0, 65535).astype(np.uint16)
+        arr_raw   = np.stack([arr_raw, arr_raw, arr_raw], axis=-1)
+        bit_depth = 16
+        norm      = 65535.0
+    else:
+        img_rgb   = img.convert("RGB")
+        arr_raw   = np.array(img_rgb)
+        if arr_raw.dtype == np.uint16:
+            bit_depth = 16
+            norm      = 65535.0
+        else:
+            bit_depth = 8
+            norm      = 255.0
+
+    arr = arr_raw.astype(np.float32) / norm
+    print(f"  Loaded      {arr.shape[1]}x{arr.shape[0]} px, "
+          f"{bit_depth}-bit RGB  (norm={norm:.0f})")
+
+    # 2. Resize if requested.
     if scale != 1.0:
-        new_w = int(img.width  * scale)
-        new_h = int(img.height * scale)
+        new_w = int(arr.shape[1] * scale)
+        new_h = int(arr.shape[0] * scale)
         new_w = new_w - (new_w % 2)
         new_h = new_h - (new_h % 2)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        print(f"  Resized     {img.width}x{img.height} px")
+        arr_u8 = (arr * 255).clip(0, 255).astype(np.uint8)
+        pil_rs = Image.fromarray(arr_u8).resize((new_w, new_h), Image.LANCZOS)
+        arr    = np.array(pil_rs).astype(np.float32) / 255.0
+        print(f"  Resized     {new_w}x{new_h} px")
 
-    arr = np.array(img).astype(np.float32) / 255.0
-    print(f"  Loaded      {arr.shape[1]}x{arr.shape[0]} px, 8-bit RGB")
-
-    # 3. Remove sRGB gamma -> linear light
-    linear = srgb_to_linear(arr)
-    print(f"  Linearised  range {linear.min():.4f}-{linear.max():.4f}")
+    # 3. Blended linearization
+    linear = apply_gamma_blend(arr, gamma_blend)
+    print(f"  Linearised  gamma_blend={gamma_blend:.2f}  "
+          f"range {linear.min():.4f}-{linear.max():.4f}")
 
     # 4. Mode-specific processing
-    be           = 0.0
+    be             = 0.0
     asshot_neutral = (1.0, 1.0, 1.0)
 
     if mode == 'mono':
-        # Rec.709 luminance weights: Y = 0.2126 R + 0.7152 G + 0.0722 B
-        # Applied in linear light (correct -- must NOT weight in gamma space)
         luma = (0.2126 * linear[:,:,0]
               + 0.7152 * linear[:,:,1]
               + 0.0722 * linear[:,:,2])
         print(f"  Luma        Rec.709  range {luma.min():.4f}-{luma.max():.4f}")
-
-        # Normalise to fill full 16-bit range.
         luma_max = float(luma.max())
         if luma_max > 0:
             luma = luma / luma_max
         print(f"  Normalised  range {luma.min():.4f}-{luma.max():.4f}  (max was {luma_max:.4f})")
-
-        # Crop to even dims
         h, w = luma.shape
         h_e, w_e = h - (h % 2), w - (w % 2)
         luma = luma[:h_e, :w_e]
-
-        # Map luma identically to all 4 Bayer positions
         bayer = np.empty((h_e, w_e), dtype=np.float32)
-        bayer[0::2, 0::2] = luma[0::2, 0::2]   # R  position
-        bayer[0::2, 1::2] = luma[0::2, 1::2]   # G1 position
-        bayer[1::2, 0::2] = luma[1::2, 0::2]   # G2 position
-        bayer[1::2, 1::2] = luma[1::2, 1::2]   # B  position
+        bayer[0::2, 0::2] = luma[0::2, 0::2]
+        bayer[0::2, 1::2] = luma[0::2, 1::2]
+        bayer[1::2, 0::2] = luma[1::2, 0::2]
+        bayer[1::2, 1::2] = luma[1::2, 1::2]
         print(f"  Remosaiced  RGGB Bayer {w_e}x{h_e} (all positions = luma)")
 
     elif mode == 'color':
-        # Gray-world white balance estimate in linear light.
-        # Per-channel mean -> normalize so G channel = 1.0
-        # AsShotNeutral = [R/G, 1.0, B/G] tells LRC where neutral is.
-        r_mean = float(linear[:,:,0].mean())
-        g_mean = float(linear[:,:,1].mean())
-        b_mean = float(linear[:,:,2].mean())
-        g_mean = max(g_mean, 1e-6)  # guard division by zero
-        asshot_neutral = (
-            min(r_mean / g_mean, 1.0),
-            1.0,
-            min(b_mean / g_mean, 1.0),
-        )
-        print(f"  WB (gray world) R/G={asshot_neutral[0]:.4f}  B/G={asshot_neutral[2]:.4f}")
+        # TIFF (LRC export): skip gray-world WB, set AsShotNeutral=(1,1,1).
+        # JPEG (raw scan): compute gray-world WB from channel means.
+        if is_tif:
+            asshot_neutral = (1.0, 1.0, 1.0)
+            print(f"  WB           TIF source -- AsShotNeutral=(1,1,1)  "
+                  f"(pre-processed, gray-world bypassed)")
+        else:
+            r_mean = float(linear[:,:,0].mean())
+            g_mean = float(linear[:,:,1].mean())
+            b_mean = float(linear[:,:,2].mean())
+            g_mean = max(g_mean, 1e-6)
+            asshot_neutral = (
+                min(r_mean / g_mean, 1.0),
+                1.0,
+                min(b_mean / g_mean, 1.0),
+            )
+            print(f"  WB (gray world) R/G={asshot_neutral[0]:.4f}  "
+                  f"B/G={asshot_neutral[2]:.4f}")
 
-        # BaselineExposure from image stats
         mean_linear = float(linear.mean())
         mean_gamma  = float(arr.mean())
         be = -math.log2(mean_gamma / mean_linear) if mean_linear > 0 else -0.579
         print(f"  BaselineExp {be:.4f} EV")
-
         h, w = linear.shape[:2]
         h_e, w_e = h - (h % 2), w - (w % 2)
         linear = linear[:h_e, :w_e, :]
-
         bayer = np.empty((h_e, w_e), dtype=np.float32)
         bayer[0::2, 0::2] = linear[0::2, 0::2, 0]
         bayer[0::2, 1::2] = linear[0::2, 1::2, 1]
@@ -329,16 +396,13 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
         print(f"  Remosaiced  RGGB Bayer {w_e}x{h_e}")
 
     elif mode == 'match':
-        # BaselineExposure computed from image stats (color path only)
         mean_linear = float(linear.mean())
         mean_gamma  = float(arr.mean())
         be = -math.log2(mean_gamma / mean_linear) if mean_linear > 0 else -0.579
         print(f"  BaselineExp {be:.4f} EV")
-
         h, w = linear.shape[:2]
         h_e, w_e = h - (h % 2), w - (w % 2)
         linear = linear[:h_e, :w_e, :]
-
         bayer = np.empty((h_e, w_e), dtype=np.float32)
         bayer[0::2, 0::2] = linear[0::2, 0::2, 0]
         bayer[0::2, 1::2] = linear[0::2, 1::2, 1]
@@ -347,11 +411,10 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
         print(f"  Remosaiced  RGGB Bayer {w_e}x{h_e}")
 
     else:
-        # neutral -- standard RGGB color path
+        # neutral
         h, w = linear.shape[:2]
         h_e, w_e = h - (h % 2), w - (w % 2)
         linear = linear[:h_e, :w_e, :]
-
         bayer = np.empty((h_e, w_e), dtype=np.float32)
         bayer[0::2, 0::2] = linear[0::2, 0::2, 0]
         bayer[0::2, 1::2] = linear[0::2, 1::2, 1]
@@ -384,12 +447,14 @@ def convert(src: Path, mode: str = 'neutral', scale: float = 1.0) -> Path:
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
-        print("Usage: py jpg_to_cfa_dng.py <input.jpg> [--mode neutral|match|mono|color] [--scale 0.5]")
+        print("Usage: py jpg_to_cfa_dng.py <input.jpg|tif> "
+              "[--mode neutral|match|mono|color] [--scale 0.5] [--gamma 0.75]")
         sys.exit(1)
 
-    src   = Path(args[0]).resolve()
-    mode  = 'neutral'
-    scale = 1.0
+    src         = Path(args[0]).resolve()
+    mode        = 'neutral'
+    scale       = 1.0
+    gamma_blend = 1.0
 
     if "--mode" in args:
         idx = args.index("--mode")
@@ -409,9 +474,19 @@ if __name__ == "__main__":
             print("ERROR: --scale requires a numeric argument e.g. --scale 0.5")
             sys.exit(1)
 
+    if "--gamma" in args:
+        idx = args.index("--gamma")
+        try:
+            gamma_blend = float(args[idx + 1])
+            if not (0.0 <= gamma_blend <= 1.0):
+                raise ValueError
+        except (IndexError, ValueError):
+            print("ERROR: --gamma must be a value between 0.0 and 1.0")
+            sys.exit(1)
+
     if not src.exists():
         print(f"ERROR: File not found: {src}")
         sys.exit(1)
 
-    result = convert(src, mode=mode, scale=scale)
+    result = convert(src, mode=mode, scale=scale, gamma_blend=gamma_blend)
     sys.exit(0 if result else 1)
